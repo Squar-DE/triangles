@@ -23,6 +23,18 @@ struct triangles_compositor;
 struct triangles_output;
 struct triangles_surface;
 struct triangles_view;
+struct triangles_dmabuf_buffer;
+struct triangles_dmabuf_params;  // defined in dmabuf.c
+
+// ─── DMA-BUF buffer wrapper ───────────────────────────────────────────────────
+// Stored as the wl_buffer user-data for every DMA-BUF-backed buffer resource.
+struct triangles_dmabuf_buffer {
+    struct triangles_compositor *compositor;
+    EGLImageKHR                  image;
+    uint32_t                     width;
+    uint32_t                     height;
+    uint32_t                     format;   // DRM fourcc
+};
 
 // Output structure - represents a physical display
 struct triangles_output {
@@ -91,6 +103,7 @@ struct triangles_surface {
     // OpenGL texture
     GLuint texture;
     EGLImageKHR egl_image;
+    bool is_dmabuf;  // true when current buffer is a DMA-BUF
 };
 
 // View - positioned surface on screen
@@ -173,6 +186,7 @@ struct triangles_compositor {
     struct wl_global *compositor_global;
     struct wl_global *subcompositor_global;
     struct wl_global *shm_global;
+    struct wl_global *dmabuf_global;  // zwp_linux_dmabuf_v1
     
     // Protocol implementations
     void *xdg_shell;
@@ -222,5 +236,15 @@ void triangles_renderer_end(struct triangles_output *output);
 // Input functions
 bool triangles_input_init(struct triangles_compositor *compositor);
 void triangles_input_handle_event(struct triangles_compositor *compositor);
+
+// DMA-BUF functions
+bool   triangles_dmabuf_init(struct triangles_compositor *compositor);
+GLuint triangles_dmabuf_import_texture(struct triangles_compositor *compositor,
+                                        struct wl_resource *buffer);
+void   triangles_dmabuf_buffer_destroy(struct wl_resource *resource);
+GLuint triangles_dmabuf_create_texture(struct triangles_compositor *compositor,
+                                        EGLImageKHR image);
+EGLImageKHR triangles_dmabuf_import_eglimage(struct triangles_compositor *compositor,
+                                              struct triangles_dmabuf_params *params);
 
 #endif // TRIANGLES_COMPOSITOR_H

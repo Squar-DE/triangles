@@ -228,7 +228,17 @@ void triangles_surface_attach_buffer(struct triangles_surface *surface,
                surface->buffer_width, surface->buffer_height, surface->buffer_format);
         fflush(stdout);
     } else {
-        printf("[SURFACE] Not a SHM buffer (DMA-BUF?)\n");
+        // DMA-BUF: pull dimensions from our buffer wrapper struct
+        struct triangles_dmabuf_buffer *dmabuf = wl_resource_get_user_data(buffer);
+        if (dmabuf) {
+            surface->buffer_width  = (int32_t)dmabuf->width;
+            surface->buffer_height = (int32_t)dmabuf->height;
+            surface->buffer_format = dmabuf->format;
+            printf("[SURFACE] DMA-BUF buffer info: %dx%d format=0x%08x\n",
+                   surface->buffer_width, surface->buffer_height, surface->buffer_format);
+        } else {
+            printf("[SURFACE] Unknown buffer type — cannot read dimensions\n");
+        }
         fflush(stdout);
     }
     
@@ -354,7 +364,9 @@ void triangles_view_destroy(struct triangles_view *view) {
     struct triangles_output *output = view->output;
     wl_list_remove(&view->link);
 
-    if (output) {
+    // Only repaint if the compositor is still running — don't touch
+    // output state during shutdown as it may already be torn down.
+    if (output && view->compositor->running) {
         triangles_output_repaint(output);
     }
     

@@ -271,6 +271,17 @@ bool triangles_compositor_init(struct triangles_compositor *compositor) {
     printf("  [INIT] XDG shell initialized\n");
     fflush(stdout);
     
+    // Initialize DMA-BUF protocol support (non-fatal if GPU doesn't support it)
+    printf("  [INIT] Initializing DMA-BUF protocol...\n");
+    fflush(stdout);
+    extern bool triangles_dmabuf_init(struct triangles_compositor *compositor);
+    if (!triangles_dmabuf_init(compositor)) {
+        fprintf(stderr, "  [INIT] Warning: DMA-BUF not available (SHM only)\n");
+    } else {
+        printf("  [INIT] DMA-BUF protocol initialized\n");
+    }
+    fflush(stdout);
+    
     printf("  [INIT] All subsystems ready!\n");
     fflush(stdout);
     return true;
@@ -278,34 +289,42 @@ bool triangles_compositor_init(struct triangles_compositor *compositor) {
 
 void triangles_compositor_destroy(struct triangles_compositor *compositor) {
     if (!compositor) return;
-    
-    // Destroy outputs
+
+    // Destroy outputs first (restores CRTC, releases GBM buffers)
     struct triangles_output *output, *tmp_output;
     wl_list_for_each_safe(output, tmp_output, &compositor->output_list, link) {
         triangles_output_destroy(output);
     }
-    
-    // Destroy surfaces
-    struct triangles_surface *surface, *tmp_surface;
-    wl_list_for_each_safe(surface, tmp_surface, &compositor->surface_list, link) {
-        triangles_surface_destroy(surface);
+
+    // Destroy the Wayland display BEFORE tearing down EGL/GBM.
+    // wl_display_destroy calls every resource destructor, including
+    // triangles_dmabuf_buffer_destroy which calls eglDestroyImageKHR.
+    // If EGL is gone first, those calls crash.
+    // Destroying the display here also handles all surfaces/views/seats
+    // that are still alive as client-owned resources — we must NOT also
+    // walk compositor->surface_list and destroy them manually, as that
+    // would double-free.
+    if (compositor->display) {
+        wl_display_destroy_clients(compositor->display);
+        wl_display_destroy(compositor->display);
+        compositor->display = NULL;
     }
-    
-    // Cleanup EGL
+
+    // Now it is safe to tear down EGL — all EGLImages have been released above
     if (compositor->egl_display != EGL_NO_DISPLAY) {
-        eglMakeCurrent(compositor->egl_display, EGL_NO_SURFACE, 
+        eglMakeCurrent(compositor->egl_display, EGL_NO_SURFACE,
                       EGL_NO_SURFACE, EGL_NO_CONTEXT);
         if (compositor->egl_context != EGL_NO_CONTEXT) {
             eglDestroyContext(compositor->egl_display, compositor->egl_context);
         }
         eglTerminate(compositor->egl_display);
     }
-    
+
     // Cleanup GBM
     if (compositor->gbm) {
         gbm_device_destroy(compositor->gbm);
     }
-    
+
     // Cleanup DRM
     if (compositor->resources) {
         drmModeFreeResources(compositor->resources);
@@ -313,26 +332,21 @@ void triangles_compositor_destroy(struct triangles_compositor *compositor) {
     if (compositor->drm_fd >= 0) {
         close(compositor->drm_fd);
     }
-    
+
     // Cleanup libinput
     if (compositor->libinput) {
         libinput_unref(compositor->libinput);
     }
-    
+
     // Cleanup udev
     if (compositor->udev) {
         udev_unref(compositor->udev);
     }
-    
-    // Cleanup Wayland
-    if (compositor->display) {
-        wl_display_destroy(compositor->display);
-    }
 
     // Cleanup libseat
-if (compositor->seat) {
-    libseat_close_seat(compositor->seat);
-}
-    
+    if (compositor->seat) {
+        libseat_close_seat(compositor->seat);
+    }
+
     free(compositor);
 }

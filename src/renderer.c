@@ -247,7 +247,7 @@ void triangles_renderer_end(struct triangles_output *output) {
     glFinish();
 }
 
-// Helper function to create texture from buffer
+// Helper function to create texture from buffer (SHM or DMA-BUF)
 GLuint triangles_renderer_create_texture(struct triangles_surface *surface,
                                         struct wl_resource *buffer) {
     if (!buffer) {
@@ -256,13 +256,31 @@ GLuint triangles_renderer_create_texture(struct triangles_surface *surface,
         return 0;
     }
     
-    // Get the SHM buffer from libwayland
+    // ── Try SHM first ────────────────────────────────────────────────────────
     struct wl_shm_buffer *shm_buffer = wl_shm_buffer_get(buffer);
     if (!shm_buffer) {
-        fprintf(stderr, "[RENDERER] Not a SHM buffer (might be DMA-BUF)\n");
+        // ── Try DMA-BUF path ─────────────────────────────────────────────────
+        // DMA-BUF buffers have our triangles_dmabuf_buffer struct as user-data.
+        // If the wl_resource user-data is non-NULL and has a valid EGLImage we
+        // know it was created through zwp_linux_buffer_params_v1.
+        printf("[RENDERER] Not a SHM buffer — attempting DMA-BUF import\n");
+        fflush(stdout);
+
+        GLuint tex = triangles_dmabuf_import_texture(surface->compositor, buffer);
+        if (tex) {
+            surface->is_dmabuf = true;
+            printf("[RENDERER] DMA-BUF texture created: %u\n", tex);
+            fflush(stdout);
+            return tex;
+        }
+
+        fprintf(stderr, "[RENDERER] DMA-BUF import also failed — unsupported buffer\n");
         fflush(stdout);
         return 0;
     }
+
+    // Reset DMA-BUF flag for SHM buffers
+    surface->is_dmabuf = false;
     
     // Get buffer properties
     int32_t width = wl_shm_buffer_get_width(shm_buffer);
