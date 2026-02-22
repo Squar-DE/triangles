@@ -31,6 +31,9 @@ static int open_restricted(const char *path, int flags, void *user_data) {
     struct triangles_compositor *compositor = user_data;
     int fd;
     int device_id = libseat_open_device(compositor->seat, path, &fd);
+    printf("[LIBSEAT] open_restricted: path=%s device_id=%d fd=%d\n",
+           path, device_id, fd);  // ← add this
+    fflush(stdout);
     if (device_id < 0) {
         fprintf(stderr, "Failed to open %s via libseat: %d\n", path, device_id);
         return -1;
@@ -80,21 +83,6 @@ static struct triangles_seat *get_seat(struct triangles_compositor *compositor) 
     struct triangles_seat *seat;
     seat = wl_container_of(compositor->seat_list.next, seat, link);
     return seat;
-}
-
-// ─── Helper: hit-test titlebar ────────────────────────────────────────────────
-
-static struct triangles_view *titlebar_at(struct triangles_compositor *compositor,
-                                           double px, double py) {
-    struct triangles_view *view;
-    wl_list_for_each(view, &compositor->view_list, link) {
-        if (!view->mapped) continue;
-        int32_t ty = view->y - TITLEBAR_HEIGHT;
-        if (px >= view->x && px < view->x + view->width &&
-            py >= ty       && py < ty + TITLEBAR_HEIGHT)
-            return view;
-    }
-    return NULL;
 }
 
 // ─── Pointer motion ──────────────────────────────────────────────────────────
@@ -183,24 +171,45 @@ static void handle_pointer_button(struct triangles_compositor *compositor,
     enum libinput_button_state state = libinput_event_pointer_get_button_state(event);
 
     if (state == LIBINPUT_BUTTON_STATE_PRESSED) {
-        // Check titlebar first — start drag if LMB on titlebar
-        struct triangles_view *hit = titlebar_at(compositor,
-                                                  seat->pointer.x,
-                                                  seat->pointer.y);
-        if (hit && button == BTN_LEFT) {
-            seat->pointer.dragging_view      = hit;
-            seat->pointer.drag_start_ptr_x   = seat->pointer.x;
-            seat->pointer.drag_start_ptr_y   = seat->pointer.y;
-            seat->pointer.drag_start_win_x   = hit->x;
-            seat->pointer.drag_start_win_y   = hit->y;
-            // Give keyboard focus to the window being dragged
-            triangles_keyboard_set_focus(seat, hit->surface);
-            return;
+        double px = seat->pointer.x;
+        double py = seat->pointer.y;
+
+        // Single hit-test respecting z-order: walk front-to-back, check
+        // titlebar strip first then surface body for each view in order.
+        struct triangles_view *hit_view = NULL;
+        bool hit_titlebar = false;
+
+        struct triangles_view *view;
+        wl_list_for_each(view, &compositor->view_list, link) {
+            if (!view->mapped) continue;
+
+            int32_t ty = view->y - TITLEBAR_HEIGHT;
+            if (px >= view->x && px < view->x + view->width &&
+                py >= ty       && py < ty + TITLEBAR_HEIGHT) {
+                hit_view     = view;
+                hit_titlebar = true;
+                break;
+            }
+            if (px >= view->x && px < view->x + view->width &&
+                py >= view->y  && py < view->y + view->height) {
+                hit_view     = view;
+                hit_titlebar = false;
+                break;
+            }
         }
 
-        // Click on a surface — raise it, give keyboard focus, forward button
-        if (seat->pointer.focus) {
-            triangles_keyboard_set_focus(seat, seat->pointer.focus);
+        if (hit_view) {
+            // Raise and focus regardless of titlebar vs surface
+            triangles_keyboard_set_focus(seat, hit_view->surface);
+
+            if (hit_titlebar && button == BTN_LEFT) {
+                seat->pointer.dragging_view    = hit_view;
+                seat->pointer.drag_start_ptr_x = px;
+                seat->pointer.drag_start_ptr_y = py;
+                seat->pointer.drag_start_win_x = hit_view->x;
+                seat->pointer.drag_start_win_y = hit_view->y;
+                return;  // don't forward click to client during drag start
+            }
         }
     }
 
@@ -290,7 +299,7 @@ bool triangles_input_init(struct triangles_compositor *compositor) {
         libseat_close_seat(compositor->seat);
         return false;
     }
-    libseat_dispatch(compositor->seat, 0);
+    while (libseat_dispatch(compositor->seat, 100) > 0);
 
     // libinput
     compositor->libinput = libinput_udev_create_context(

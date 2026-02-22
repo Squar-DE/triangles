@@ -17,6 +17,7 @@
 #include <stdint.h>
 #include <pixman-1/pixman.h>
 #include <libseat.h>
+#include <sys/mman.h>
 
 // Forward declarations
 struct triangles_compositor;
@@ -144,6 +145,7 @@ struct triangles_view {
     struct triangles_titlebar titlebar;
 
     bool mapped;
+    bool has_csd;
 };
 
 // Seat - input device grouping
@@ -267,6 +269,7 @@ struct triangles_view *triangles_view_create(struct triangles_surface *surface);
 void triangles_view_destroy(struct triangles_view *view);
 void triangles_view_map(struct triangles_view *view, int32_t x, int32_t y);
 void triangles_view_unmap(struct triangles_view *view);
+void triangles_view_raise(struct triangles_view *view);
 
 // Rendering functions
 bool triangles_renderer_init(struct triangles_compositor *compositor);

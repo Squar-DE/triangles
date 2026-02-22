@@ -89,20 +89,32 @@ static uint32_t get_fb_for_bo(int drm_fd, struct gbm_bo *bo) {
 static void output_handle_drm_flip(int fd, unsigned int sequence,
                                     unsigned int tv_sec, unsigned int tv_usec,
                                     void *user_data) {
-    (void)fd; (void)sequence; (void)tv_sec; (void)tv_usec;
+    (void)fd; (void)sequence;
     struct triangles_output *output = user_data;
+    uint32_t time_ms = tv_sec * 1000 + tv_usec / 1000;
 
-    // The flip completed — previous front buffer can be released
     if (output->current_bo)
         gbm_surface_release_buffer(output->gbm_surface, output->current_bo);
 
-    output->current_bo  = output->next_bo;
-    output->fb_id       = output->next_fb_id;
-    output->next_bo     = NULL;
-    output->next_fb_id  = 0;
+    output->current_bo   = output->next_bo;
+    output->fb_id        = output->next_fb_id;
+    output->next_bo      = NULL;
+    output->next_fb_id   = 0;
     output->flip_pending = false;
 
-    // If another repaint was requested while the flip was in flight, do it now
+    // Fire frame callbacks now that the frame is actually on screen
+    struct triangles_compositor *compositor = output->compositor;
+    struct triangles_view *view;
+    wl_list_for_each(view, &compositor->view_list, link) {
+        if (!view->mapped || view->output != output || !view->surface) continue;
+        struct wl_resource *cb, *tmp;
+        wl_resource_for_each_safe(cb, tmp, &view->surface->frame_callbacks) {
+            wl_callback_send_done(cb, time_ms);
+            wl_resource_destroy(cb);
+        }
+        wl_list_init(&view->surface->frame_callbacks);
+    }
+
     if (output->needs_repaint) {
         output->needs_repaint = false;
         triangles_output_repaint(output);
@@ -392,7 +404,8 @@ void triangles_output_repaint(struct triangles_output *output) {
     struct triangles_view *view;
     wl_list_for_each(view, &compositor->view_list, link) {
         if (view->mapped && view->output == output) {
-            triangles_renderer_render_titlebar(view);
+            if (!view->has_csd)
+                triangles_renderer_render_titlebar(view);
             triangles_renderer_render_view(view);
         }
     }

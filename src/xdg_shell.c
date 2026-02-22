@@ -25,6 +25,8 @@ struct triangles_xdg_toplevel {
     char *app_id;
     
     int32_t width, height;
+    int32_t geom_x, geom_y;          // window geometry offset (from set_window_geometry)
+    int32_t geom_width, geom_height;  // 0 = unset, use full buffer size
     bool maximized;
     bool fullscreen;
     bool activated;
@@ -138,7 +140,9 @@ static void xdg_toplevel_handle_surface_commit(void *data) {
     if (toplevel->view && toplevel->xdg_surface->surface->has_buffer && !toplevel->view->mapped) {
         static int window_offset = 0;
         int32_t wx = 100 + window_offset;
-        int32_t wy = TITLEBAR_HEIGHT + 100 + window_offset;
+        int32_t decoration_height = (toplevel->geom_y > 0) ? 0 : TITLEBAR_HEIGHT;
+        int32_t wy = decoration_height + 100 + window_offset;
+        toplevel->view->has_csd = (toplevel->geom_y > 0);
         triangles_view_map(toplevel->view, wx, wy);
         window_offset += 50;
         if (window_offset > 200) window_offset = 0;
@@ -150,7 +154,6 @@ static void xdg_toplevel_handle_surface_commit(void *data) {
                 comp->seat_list.next, seat, link);
             triangles_keyboard_set_focus(seat, toplevel->xdg_surface->surface);
         }
-
         printf("Mapped toplevel view at %d, %d\n", wx, wy);
     }
 }
@@ -232,10 +235,18 @@ static void xdg_surface_get_popup(struct wl_client *client,
 }
 
 static void xdg_surface_set_window_geometry(struct wl_client *client,
-                                           struct wl_resource *resource,
-                                           int32_t x, int32_t y,
-                                           int32_t width, int32_t height) {
-    // Store window geometry
+                                             struct wl_resource *resource,
+                                             int32_t x, int32_t y,
+                                             int32_t width, int32_t height) {
+    struct triangles_xdg_surface *xdg_surface = wl_resource_get_user_data(resource);
+    struct triangles_xdg_toplevel *toplevel = xdg_surface->role_object;
+    if (!toplevel) return;
+    toplevel->geom_x      = x;
+    toplevel->geom_y      = y;
+    toplevel->geom_width  = width;
+    toplevel->geom_height = height;
+    // The geometry offset tells us the client already has its own decoration
+    // at the top of the buffer — suppress our compositor titlebar if geom_y > 0
 }
 
 static void xdg_surface_ack_configure(struct wl_client *client,

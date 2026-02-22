@@ -170,6 +170,24 @@ struct triangles_surface *triangles_surface_create(struct wl_client *client,
 void triangles_surface_destroy(struct triangles_surface *surface) {
     if (!surface) return;
 
+    // Clear any seat focus that points to this surface to avoid dangling pointers
+    struct triangles_seat *seat;
+    wl_list_for_each(seat, &surface->compositor->seat_list, link) {
+        if (seat->keyboard.focus == surface) {
+            seat->keyboard.focus = NULL;
+        }
+        if (seat->pointer.focus == surface) {
+            seat->pointer.focus = NULL;
+        }
+        if (seat->pointer.cursor_surface == surface) {
+            seat->pointer.cursor_surface = NULL;
+        }
+        if (seat->pointer.dragging_view &&
+            seat->pointer.dragging_view->surface == surface) {
+            seat->pointer.dragging_view = NULL;
+        }
+    }
+
     struct triangles_view *view, *v_tmp;
     wl_list_for_each_safe(view, v_tmp, &surface->compositor->view_list, link) {
         if (view->surface == surface) {
@@ -297,26 +315,6 @@ void triangles_surface_commit(struct triangles_surface *surface) {
         surface->commit_handler(surface->role_data);
     }
     
-    // Count frame callbacks
-    int callback_count = 0;
-    struct wl_resource *callback, *tmp;
-    wl_resource_for_each_safe(callback, tmp, &surface->frame_callbacks) {
-        callback_count++;
-    }
-    
-    printf("[COMMIT] Sending %d frame callbacks\n", callback_count);
-    fflush(stdout);
-    
-    // Send frame callbacks - tell client it can render next frame
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    uint32_t time_ms = now.tv_sec * 1000 + now.tv_nsec / 1000000; // TODO: Use actual timestamp
-    wl_resource_for_each_safe(callback, tmp, &surface->frame_callbacks) {
-        wl_callback_send_done(callback, time_ms);
-        wl_resource_destroy(callback);
-    }
-    wl_list_init(&surface->frame_callbacks);
-    
     // Clear damage (we've processed it)
     pixman_region32_clear(&surface->damage);
     
@@ -327,6 +325,17 @@ void triangles_surface_commit(struct triangles_surface *surface) {
             printf("[COMMIT] Triggering repaint\n");
             fflush(stdout);
             triangles_output_schedule_repaint(view->output);
+        }
+    }
+    struct triangles_seat *seat;
+    wl_list_for_each(seat, &surface->compositor->seat_list, link) {
+        if (seat->pointer.cursor_surface == surface) {
+            if (!wl_list_empty(&surface->compositor->output_list)) {
+                struct triangles_output *output = wl_container_of(
+                    surface->compositor->output_list.next, output, link);
+                triangles_output_schedule_repaint(output);
+            }
+            break;
         }
     }
     
@@ -356,6 +365,13 @@ struct triangles_view *triangles_view_create(struct triangles_surface *surface) 
     wl_list_insert(&surface->compositor->view_list, &view->link);
     
     return view;
+}
+
+// Move view to the front of the view_list (highest z-order).
+void triangles_view_raise(struct triangles_view *view) {
+    if (!view) return;
+    wl_list_remove(&view->link);
+    wl_list_insert(&view->compositor->view_list, &view->link);
 }
 
 void triangles_view_destroy(struct triangles_view *view) {

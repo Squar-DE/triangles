@@ -5,6 +5,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <errno.h>
 #include <time.h>
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -27,13 +28,36 @@ static void compositor_create_surface(struct wl_client *client,
     triangles_surface_create(client, resource, id);
 }
 
+static void region_destroy(struct wl_client *client,
+                            struct wl_resource *resource) {
+    (void)client;
+    wl_resource_destroy(resource);
+}
+
+static void region_add(struct wl_client *client, struct wl_resource *resource,
+                        int32_t x, int32_t y, int32_t width, int32_t height) {
+    (void)client; (void)resource; (void)x; (void)y; (void)width; (void)height;
+    // TODO: track damage/input/opaque regions properly
+}
+
+static void region_subtract(struct wl_client *client, struct wl_resource *resource,
+                              int32_t x, int32_t y, int32_t width, int32_t height) {
+    (void)client; (void)resource; (void)x; (void)y; (void)width; (void)height;
+}
+
+static const struct wl_region_interface region_interface = {
+    .destroy  = region_destroy,
+    .add      = region_add,
+    .subtract = region_subtract,
+};
+
 static void compositor_create_region(struct wl_client *client,
                                      struct wl_resource *resource,
                                      uint32_t id) {
     struct wl_resource *region_resource = wl_resource_create(client,
         &wl_region_interface, wl_resource_get_version(resource), id);
-    if (!region_resource) wl_client_post_no_memory(client);
-    // TODO: implement region; for now just a no-op placeholder
+    if (!region_resource) { wl_client_post_no_memory(client); return; }
+    wl_resource_set_implementation(region_resource, &region_interface, NULL, NULL);
 }
 
 static const struct wl_compositor_interface compositor_interface = {
@@ -149,6 +173,7 @@ static void seat_get_keyboard(struct wl_client *client,
 
 void triangles_keyboard_set_focus(struct triangles_seat *seat,
                                    struct triangles_surface *surface) {
+    if (!seat->keyboard.state) return;
     struct wl_display *display = seat->compositor->display;
     uint32_t serial = wl_display_next_serial(display);
 
@@ -167,6 +192,15 @@ void triangles_keyboard_set_focus(struct triangles_seat *seat,
     seat->keyboard.focus = surface;
     if (!surface) return;
 
+    // Raise the focused window to the top of the z-order
+    struct triangles_view *view;
+    wl_list_for_each(view, &seat->compositor->view_list, link) {
+        if (view->surface == surface) {
+            triangles_view_raise(view);
+            break;
+        }
+    }
+
     // Build held-keys array for enter event
     struct wl_array keys_array;
     wl_array_init(&keys_array);
@@ -177,11 +211,24 @@ void triangles_keyboard_set_focus(struct triangles_seat *seat,
                seat->keyboard.num_keys * sizeof(uint32_t));
     }
 
-    struct wl_client *new_client = wl_resource_get_client(surface->resource);
+struct wl_client *new_client = wl_resource_get_client(surface->resource);
+
+    // Compute modifier state once (guard against state not yet initialized)
+    xkb_mod_mask_t depressed = 0, latched = 0, locked = 0;
+    xkb_layout_index_t group = 0;
+    if (seat->keyboard.state) {
+        depressed = xkb_state_serialize_mods(seat->keyboard.state, XKB_STATE_MODS_DEPRESSED);
+        latched   = xkb_state_serialize_mods(seat->keyboard.state, XKB_STATE_MODS_LATCHED);
+        locked    = xkb_state_serialize_mods(seat->keyboard.state, XKB_STATE_MODS_LOCKED);
+        group     = xkb_state_serialize_layout(seat->keyboard.state, XKB_STATE_LAYOUT_EFFECTIVE);
+    }
+
+    uint32_t mod_serial = wl_display_next_serial(display);
     struct wl_resource *kbd;
     wl_resource_for_each(kbd, &seat->keyboard_resources) {
-        if (wl_resource_get_client(kbd) == new_client)
-            wl_keyboard_send_enter(kbd, serial, surface->resource, &keys_array);
+        if (wl_resource_get_client(kbd) != new_client) continue;
+        wl_keyboard_send_enter(kbd, serial, surface->resource, &keys_array);
+        wl_keyboard_send_modifiers(kbd, mod_serial, depressed, latched, locked, group);
     }
     wl_array_release(&keys_array);
 }
@@ -266,6 +313,13 @@ static void pointer_set_cursor(struct wl_client *client,
     } else {
         // NULL surface = hide cursor
         seat->pointer.cursor_surface = NULL;
+    }
+// Schedule repaint so new cursor appears immediately
+    struct triangles_compositor *comp = seat->compositor;
+    if (!wl_list_empty(&comp->output_list)) {
+        struct triangles_output *output = wl_container_of(
+            comp->output_list.next, output, link);
+        triangles_output_schedule_repaint(output);
     }
 }
 
@@ -507,6 +561,80 @@ void triangles_seat_update_keymap(struct triangles_seat *seat) {
            seat->keyboard.keymap_size);
 }
 
+// ─── wl_data_device_manager ───────────────────────────────────────────────────
+// Clients bind this to get clipboard/DnD support. We stub it so they don't
+// crash on bind, but don't implement actual data transfer yet.
+
+static void data_device_release(struct wl_client *client,
+                                 struct wl_resource *resource) {
+    (void)client;
+    wl_resource_destroy(resource);
+}
+
+static void data_device_start_drag(struct wl_client *c, struct wl_resource *r,
+                                    struct wl_resource *src, struct wl_resource *origin,
+                                    struct wl_resource *icon, uint32_t serial) {
+    (void)c;(void)r;(void)src;(void)origin;(void)icon;(void)serial;
+}
+static void data_device_set_selection(struct wl_client *c, struct wl_resource *r,
+                                       struct wl_resource *src, uint32_t serial) {
+    (void)c;(void)r;(void)src;(void)serial;
+}
+
+static const struct wl_data_device_interface data_device_interface = {
+    .start_drag    = data_device_start_drag,
+    .set_selection = data_device_set_selection,
+    .release       = data_device_release,
+};
+
+static void data_source_offer(struct wl_client *c, struct wl_resource *r,
+                               const char *mime) { (void)c;(void)r;(void)mime; }
+static void data_source_destroy(struct wl_client *c, struct wl_resource *r) {
+    (void)c; wl_resource_destroy(r);
+}
+static void data_source_set_actions(struct wl_client *c, struct wl_resource *r,
+                                     uint32_t a) { (void)c;(void)r;(void)a; }
+
+static const struct wl_data_source_interface data_source_interface = {
+    .offer       = data_source_offer,
+    .destroy     = data_source_destroy,
+    .set_actions = data_source_set_actions,
+};
+
+static void ddm_create_data_source(struct wl_client *client,
+                                    struct wl_resource *resource, uint32_t id) {
+    (void)resource;
+    struct wl_resource *src = wl_resource_create(client,
+        &wl_data_source_interface, 3, id);
+    if (!src) { wl_client_post_no_memory(client); return; }
+    wl_resource_set_implementation(src, &data_source_interface, NULL, NULL);
+}
+
+static void ddm_get_data_device(struct wl_client *client,
+                                 struct wl_resource *resource,
+                                 uint32_t id,
+                                 struct wl_resource *seat_resource) {
+    (void)resource; (void)seat_resource;
+    struct wl_resource *dev = wl_resource_create(client,
+        &wl_data_device_interface, 3, id);
+    if (!dev) { wl_client_post_no_memory(client); return; }
+    wl_resource_set_implementation(dev, &data_device_interface, NULL, NULL);
+}
+
+static const struct wl_data_device_manager_interface ddm_interface = {
+    .create_data_source = ddm_create_data_source,
+    .get_data_device    = ddm_get_data_device,
+};
+
+static void ddm_bind(struct wl_client *client, void *data,
+                     uint32_t version, uint32_t id) {
+    (void)data;
+    struct wl_resource *resource = wl_resource_create(client,
+        &wl_data_device_manager_interface, version, id);
+    if (!resource) { wl_client_post_no_memory(client); return; }
+    wl_resource_set_implementation(resource, &ddm_interface, NULL, NULL);
+}
+
 // ─── Protocol init ────────────────────────────────────────────────────────────
 
 bool triangles_compositor_protocol_init(struct triangles_compositor *compositor) {
@@ -544,6 +672,13 @@ bool triangles_compositor_protocol_init(struct triangles_compositor *compositor)
     if (!seat->global) { free(seat->name); free(seat); return false; }
 
     wl_list_insert(&compositor->seat_list, &seat->link);
+
+    // wl_data_device_manager — needed by most clients even if clipboard is stubbed
+    if (!wl_global_create(compositor->display,
+            &wl_data_device_manager_interface, 3, NULL, ddm_bind)) {
+        fprintf(stderr, "[PROTOCOL] Failed to create wl_data_device_manager\n");
+        return false;
+    }
 
     printf("Core Wayland protocols initialized\n");
     return true;

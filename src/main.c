@@ -73,14 +73,20 @@ int main(int argc, char *argv[]) {
 
     while (compositor->running) {
         wl_display_flush_clients(compositor->display);
-        // Block until an event arrives (input, DRM flip, client request).
-        // DRM page-flip callbacks are dispatched here via the drm_fd event
-        // source, which schedules the next repaint if needs_repaint is set.
-        wl_event_loop_dispatch(compositor->event_loop, -1);
+
+        // Check if any output needs a repaint so we can set dispatch timeout
+        bool repaint_pending = false;
+        struct triangles_output *output;
+        wl_list_for_each(output, &compositor->output_list, link) {
+            if (output->needs_repaint) { repaint_pending = true; break; }
+        }
+
+        // Non-blocking when a repaint is queued so we don't stall input
+        // processing while waiting for the DRM flip callback.
+        // Block indefinitely (-1) when idle — no point spinning.
+        wl_event_loop_dispatch(compositor->event_loop, repaint_pending ? 0 : -1);
 
         // Kick off any repaints that were scheduled during this dispatch
-        // but couldn't run because a flip was already in flight.
-        struct triangles_output *output;
         wl_list_for_each(output, &compositor->output_list, link) {
             if (output->needs_repaint && !output->flip_pending) {
                 output->needs_repaint = false;
