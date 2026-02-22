@@ -326,7 +326,7 @@ void triangles_surface_commit(struct triangles_surface *surface) {
         if (view->surface == surface && view->mapped && view->output) {
             printf("[COMMIT] Triggering repaint\n");
             fflush(stdout);
-            triangles_output_repaint(view->output);
+            triangles_output_schedule_repaint(view->output);
         }
     }
     
@@ -367,7 +367,7 @@ void triangles_view_destroy(struct triangles_view *view) {
     // Only repaint if the compositor is still running — don't touch
     // output state during shutdown as it may already be torn down.
     if (output && view->compositor->running) {
-        triangles_output_repaint(output);
+        triangles_output_schedule_repaint(output);
     }
     
     free(view);
@@ -397,7 +397,7 @@ void triangles_view_map(struct triangles_view *view, int32_t x, int32_t y) {
     if (view->output) {
         printf("[VIEW] Triggering repaint for mapped view\n");
         fflush(stdout);
-        triangles_output_repaint(view->output);
+        triangles_output_schedule_repaint(view->output);
     }
 }
 
@@ -408,6 +408,6 @@ void triangles_view_unmap(struct triangles_view *view) {
     
     // Trigger repaint to remove from screen
     if (view->output) {
-        triangles_output_repaint(view->output);
+        triangles_output_schedule_repaint(view->output);
     }
 }

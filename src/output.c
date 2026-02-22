@@ -48,18 +48,65 @@ static void output_bind(struct wl_client *client, void *data,
     }
 }
 
-static void output_handle_drm_flip(int fd, unsigned int sequence,
-                                  unsigned int tv_sec, unsigned int tv_usec,
-                                  void *user_data) {
-    struct triangles_output *output = user_data;
-    
-    // Release old buffer
-    if (output->current_bo) {
-        gbm_surface_release_buffer(output->gbm_surface, output->current_bo);
+// Per-BO framebuffer cache — stored as GBM BO user data so we only call
+// drmModeAddFB once per buffer object, not once per frame.
+struct bo_fb {
+    uint32_t fb_id;
+};
+
+static void bo_fb_destroy(struct gbm_bo *bo, void *data) {
+    struct bo_fb *cache = data;
+    // Retrieve the drm_fd via the gbm device
+    int drm_fd = gbm_device_get_fd(gbm_bo_get_device(bo));
+    drmModeRmFB(drm_fd, cache->fb_id);
+    free(cache);
+}
+
+static uint32_t get_fb_for_bo(int drm_fd, struct gbm_bo *bo) {
+    // Return cached fb_id if we already created one for this BO
+    struct bo_fb *cache = gbm_bo_get_user_data(bo);
+    if (cache) return cache->fb_id;
+
+    uint32_t fb_id;
+    int ret = drmModeAddFB(drm_fd,
+                           gbm_bo_get_width(bo),
+                           gbm_bo_get_height(bo),
+                           24, 32,
+                           gbm_bo_get_stride(bo),
+                           gbm_bo_get_handle(bo).u32,
+                           &fb_id);
+    if (ret) {
+        fprintf(stderr, "[OUTPUT] drmModeAddFB failed: %d\n", ret);
+        return 0;
     }
-    
-    output->current_bo = output->next_bo;
-    output->next_bo = NULL;
+
+    cache = calloc(1, sizeof(*cache));
+    cache->fb_id = fb_id;
+    gbm_bo_set_user_data(bo, cache, bo_fb_destroy);
+    return fb_id;
+}
+
+static void output_handle_drm_flip(int fd, unsigned int sequence,
+                                    unsigned int tv_sec, unsigned int tv_usec,
+                                    void *user_data) {
+    (void)fd; (void)sequence; (void)tv_sec; (void)tv_usec;
+    struct triangles_output *output = user_data;
+
+    // The flip completed — previous front buffer can be released
+    if (output->current_bo)
+        gbm_surface_release_buffer(output->gbm_surface, output->current_bo);
+
+    output->current_bo  = output->next_bo;
+    output->fb_id       = output->next_fb_id;
+    output->next_bo     = NULL;
+    output->next_fb_id  = 0;
+    output->flip_pending = false;
+
+    // If another repaint was requested while the flip was in flight, do it now
+    if (output->needs_repaint) {
+        output->needs_repaint = false;
+        triangles_output_repaint(output);
+    }
 }
 
 struct triangles_output *triangles_output_create(struct triangles_compositor *compositor,
@@ -198,6 +245,23 @@ if (!output->gbm_surface) {
 printf("      [OUTPUT_CREATE] GBM surface created successfully\n");
 fflush(stdout); 
     drmModeFreeConnector(connector);
+
+    // Create the EGL window surface once — reused every frame.
+    // GBM requires the surface to persist so it can manage the buffer queue.
+    output->egl_surface = eglCreateWindowSurface(
+        compositor->egl_display,
+        compositor->egl_config,
+        (EGLNativeWindowType)output->gbm_surface,
+        NULL);
+    if (output->egl_surface == EGL_NO_SURFACE) {
+        fprintf(stderr, "      [OUTPUT_CREATE] Failed to create EGL surface: 0x%x\n",
+                eglGetError());
+        gbm_surface_destroy(output->gbm_surface);
+        free(output);
+        return NULL;
+    }
+    printf("      [OUTPUT_CREATE] EGL surface created\n");
+    fflush(stdout);
     
     printf("      [OUTPUT_CREATE] Creating Wayland global...\n");
     fflush(stdout);
@@ -249,6 +313,11 @@ void triangles_output_destroy(struct triangles_output *output) {
         drmModeRmFB(output->compositor->drm_fd, output->fb_id);
     }
     
+    // Cleanup EGL surface
+    if (output->egl_surface != EGL_NO_SURFACE) {
+        eglDestroySurface(output->compositor->egl_display, output->egl_surface);
+    }
+
     // Cleanup GBM
     if (output->current_bo) {
         gbm_surface_release_buffer(output->gbm_surface, output->current_bo);
@@ -284,114 +353,100 @@ void triangles_output_set_scale(struct triangles_output *output, double scale) {
     triangles_output_repaint(output);
 }
 
+// Schedule a repaint for the next event loop iteration.
+// Fast — just sets a flag. The main loop drains these after dispatch.
+// Called from the main loop's DRM fd event source to service flip callbacks.
+void triangles_output_drm_dispatch(struct triangles_compositor *compositor) {
+    drmEventContext evctx = {
+        .version            = DRM_EVENT_CONTEXT_VERSION,
+        .page_flip_handler  = output_handle_drm_flip,
+    };
+    drmHandleEvent(compositor->drm_fd, &evctx);
+}
+
+void triangles_output_schedule_repaint(struct triangles_output *output) {
+    output->needs_repaint = true;
+}
+
 void triangles_output_repaint(struct triangles_output *output) {
     struct triangles_compositor *compositor = output->compositor;
-    
-    printf("[REPAINT] Starting repaint for output %dx%d\n", output->width, output->height);
-    fflush(stdout);
-    
-    // Create EGL surface for this output
-    EGLSurface egl_surface = eglCreateWindowSurface(compositor->egl_display,
-                                                    compositor->egl_config,
-                                                    (EGLNativeWindowType)output->gbm_surface,
-                                                    NULL);
-    if (egl_surface == EGL_NO_SURFACE) {
-        fprintf(stderr, "[REPAINT] Failed to create EGL surface: 0x%x\n", eglGetError());
+
+    // Don't queue a second flip while one is already in flight —
+    // mark dirty so the flip callback will repaint when it lands.
+    if (output->flip_pending) {
+        output->needs_repaint = true;
         return;
     }
-    
-    // Make current
-    if (!eglMakeCurrent(compositor->egl_display, egl_surface, egl_surface,
-                       compositor->egl_context)) {
-        fprintf(stderr, "[REPAINT] Failed to make EGL context current: 0x%x\n", eglGetError());
-        eglDestroySurface(compositor->egl_display, egl_surface);
+
+    if (output->egl_surface == EGL_NO_SURFACE) return;
+
+    if (!eglMakeCurrent(compositor->egl_display,
+                        output->egl_surface, output->egl_surface,
+                        compositor->egl_context)) {
+        fprintf(stderr, "[REPAINT] eglMakeCurrent failed: 0x%x\n", eglGetError());
         return;
     }
-    
-    // Begin rendering frame
+
     triangles_renderer_begin(output);
-    
-    // Count and render all mapped views on this output
-    int view_count = 0;
+
     struct triangles_view *view;
     wl_list_for_each(view, &compositor->view_list, link) {
         if (view->mapped && view->output == output) {
-            printf("[REPAINT] Rendering view at (%d, %d) size %dx%d, texture=%u\n",
-                   view->x, view->y, view->width, view->height, 
-                   view->surface ? view->surface->texture : 0);
-            fflush(stdout);
+            triangles_renderer_render_titlebar(view);
             triangles_renderer_render_view(view);
-            view_count++;
         }
     }
-    
-    printf("[REPAINT] Rendered %d views\n", view_count);
-    fflush(stdout);
-    
-    // End rendering
+
+    if (!wl_list_empty(&compositor->seat_list)) {
+        struct triangles_seat *seat = wl_container_of(
+            compositor->seat_list.next, seat, link);
+        triangles_renderer_render_cursor(seat, output);
+    }
+
     triangles_renderer_end(output);
-    
-    // Swap buffers
-    if (!eglSwapBuffers(compositor->egl_display, egl_surface)) {
-        fprintf(stderr, "[REPAINT] Failed to swap buffers: 0x%x\n", eglGetError());
-        eglDestroySurface(compositor->egl_display, egl_surface);
+
+    if (!eglSwapBuffers(compositor->egl_display, output->egl_surface)) {
+        fprintf(stderr, "[REPAINT] eglSwapBuffers failed: 0x%x\n", eglGetError());
         return;
     }
-    
-    printf("[REPAINT] Buffers swapped\n");
-    fflush(stdout);
-    
-    // Get buffer and create framebuffer
+
     struct gbm_bo *bo = gbm_surface_lock_front_buffer(output->gbm_surface);
     if (!bo) {
-        fprintf(stderr, "[REPAINT] Failed to lock front buffer\n");
-        eglDestroySurface(compositor->egl_display, egl_surface);
+        fprintf(stderr, "[REPAINT] gbm_surface_lock_front_buffer failed\n");
         return;
     }
-    
-    uint32_t fb_id;
-    uint32_t handle = gbm_bo_get_handle(bo).u32;
-    uint32_t stride = gbm_bo_get_stride(bo);
-    uint32_t width = gbm_bo_get_width(bo);
-    uint32_t height = gbm_bo_get_height(bo);
-    
-    int ret = drmModeAddFB(compositor->drm_fd, width, height,
-                          24, 32, stride, handle, &fb_id);
-    if (ret) {
-        fprintf(stderr, "[REPAINT] Failed to create framebuffer: %d\n", ret);
+
+    uint32_t fb_id = get_fb_for_bo(compositor->drm_fd, bo);
+    if (!fb_id) {
         gbm_surface_release_buffer(output->gbm_surface, bo);
-        eglDestroySurface(compositor->egl_display, egl_surface);
         return;
     }
-    
-    printf("[REPAINT] Created framebuffer %u\n", fb_id);
-    fflush(stdout);
-    
-    // Set CRTC for scanout
-    ret = drmModeSetCrtc(compositor->drm_fd, output->crtc_id, fb_id,
-                        0, 0, &output->connector_id, 1, &output->mode);
+
+    // First frame: use SetCrtc to establish the mode, then switch to PageFlip.
+    if (!output->current_bo) {
+        int ret = drmModeSetCrtc(compositor->drm_fd, output->crtc_id, fb_id,
+                                 0, 0, &output->connector_id, 1, &output->mode);
+        if (ret) {
+            fprintf(stderr, "[REPAINT] drmModeSetCrtc failed: %d\n", ret);
+            gbm_surface_release_buffer(output->gbm_surface, bo);
+            return;
+        }
+        // On the very first frame there's no previous BO to release yet
+        output->current_bo = bo;
+        output->fb_id      = fb_id;
+        return;
+    }
+
+    // All subsequent frames: non-blocking page flip
+    int ret = drmModePageFlip(compositor->drm_fd, output->crtc_id, fb_id,
+                               DRM_MODE_PAGE_FLIP_EVENT, output);
     if (ret) {
-        fprintf(stderr, "[REPAINT] Failed to set CRTC: %d\n", ret);
-        drmModeRmFB(compositor->drm_fd, fb_id);
+        fprintf(stderr, "[REPAINT] drmModePageFlip failed: %d\n", ret);
         gbm_surface_release_buffer(output->gbm_surface, bo);
-        eglDestroySurface(compositor->egl_display, egl_surface);
         return;
     }
-    
-    printf("[REPAINT] CRTC set successfully - frame displayed!\n");
-    fflush(stdout);
-    
-    // Clean up old framebuffer and buffer
-    if (output->fb_id) {
-        drmModeRmFB(compositor->drm_fd, output->fb_id);
-    }
-    if (output->current_bo) {
-        gbm_surface_release_buffer(output->gbm_surface, output->current_bo);
-    }
-    
-    output->fb_id = fb_id;
-    output->current_bo = output->next_bo;
-    output->next_bo = bo;
-    
-    eglDestroySurface(compositor->egl_display, egl_surface);
+
+    output->next_bo      = bo;
+    output->next_fb_id   = fb_id;
+    output->flip_pending = true;
 }

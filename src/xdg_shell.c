@@ -136,13 +136,22 @@ static void xdg_toplevel_handle_surface_commit(void *data) {
     
     // Map the view if it has a buffer
     if (toplevel->view && toplevel->xdg_surface->surface->has_buffer && !toplevel->view->mapped) {
-        // Position the window (simple tiling for now - just stack them)
         static int window_offset = 0;
-        triangles_view_map(toplevel->view, 100 + window_offset, 100 + window_offset);
+        int32_t wx = 100 + window_offset;
+        int32_t wy = TITLEBAR_HEIGHT + 100 + window_offset;
+        triangles_view_map(toplevel->view, wx, wy);
         window_offset += 50;
         if (window_offset > 200) window_offset = 0;
-        
-        printf("Mapped toplevel view at %d, %d\n", toplevel->view->x, toplevel->view->y);
+
+        // Give keyboard focus on map
+        struct triangles_compositor *comp = toplevel->xdg_surface->surface->compositor;
+        if (!wl_list_empty(&comp->seat_list)) {
+            struct triangles_seat *seat = wl_container_of(
+                comp->seat_list.next, seat, link);
+            triangles_keyboard_set_focus(seat, toplevel->xdg_surface->surface);
+        }
+
+        printf("Mapped toplevel view at %d, %d\n", wx, wy);
     }
 }
 
@@ -280,13 +289,21 @@ static void xdg_toplevel_handle_commit(struct triangles_xdg_toplevel *toplevel) 
     
     // Map the view if it has a buffer
     if (toplevel->view && toplevel->xdg_surface->surface->has_buffer && !toplevel->view->mapped) {
-        // Position the window (simple tiling for now - just stack them)
         static int window_offset = 0;
-        triangles_view_map(toplevel->view, 100 + window_offset, 100 + window_offset);
+        int32_t wx = 100 + window_offset;
+        int32_t wy = TITLEBAR_HEIGHT + 100 + window_offset;
+        triangles_view_map(toplevel->view, wx, wy);
         window_offset += 50;
         if (window_offset > 200) window_offset = 0;
-        
-        printf("Mapped toplevel view at %d, %d\n", toplevel->view->x, toplevel->view->y);
+
+        struct triangles_compositor *comp = toplevel->xdg_surface->surface->compositor;
+        if (!wl_list_empty(&comp->seat_list)) {
+            struct triangles_seat *seat = wl_container_of(
+                comp->seat_list.next, seat, link);
+            triangles_keyboard_set_focus(seat, toplevel->xdg_surface->surface);
+        }
+
+        printf("Mapped toplevel view at %d, %d\n", wx, wy);
     }
 }
 

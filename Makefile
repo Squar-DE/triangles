@@ -1,7 +1,7 @@
 # Makefile for Triangles Wayland Compositor
 
 CC = gcc
-CFLAGS = -Wall -Wextra -g -O2
+CFLAGS = -Wall -Wextra -g -O2 -D _GNU_SOURCE
 PKGCONFIG = pkg-config
 
 # Directory structure

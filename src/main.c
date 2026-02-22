@@ -70,15 +70,23 @@ int main(int argc, char *argv[]) {
     printf("=== Compositor ready, entering main loop ===\n");
     printf("Press Ctrl+Alt+Backspace to quit\n");
     fflush(stdout);
-    
-    int loop_count = 0;
+
     while (compositor->running) {
-        if (loop_count < 5) {
-            printf("Event loop iteration %d...\n", loop_count++);
-            fflush(stdout);
-        }
         wl_display_flush_clients(compositor->display);
+        // Block until an event arrives (input, DRM flip, client request).
+        // DRM page-flip callbacks are dispatched here via the drm_fd event
+        // source, which schedules the next repaint if needs_repaint is set.
         wl_event_loop_dispatch(compositor->event_loop, -1);
+
+        // Kick off any repaints that were scheduled during this dispatch
+        // but couldn't run because a flip was already in flight.
+        struct triangles_output *output;
+        wl_list_for_each(output, &compositor->output_list, link) {
+            if (output->needs_repaint && !output->flip_pending) {
+                output->needs_repaint = false;
+                triangles_output_repaint(output);
+            }
+        }
     }
 
     printf("Shutting down compositor...\n");

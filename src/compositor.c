@@ -188,6 +188,12 @@ static bool init_outputs(struct triangles_compositor *compositor) {
     return true;
 }
 
+static int drm_event_source_dispatch(int fd, uint32_t mask, void *data) {
+    (void)fd; (void)mask;
+    triangles_output_drm_dispatch((struct triangles_compositor *)data);
+    return 0;
+}
+
 bool triangles_compositor_init(struct triangles_compositor *compositor) {
     printf("  [INIT] Starting udev...\n");
     fflush(stdout);
@@ -240,6 +246,15 @@ bool triangles_compositor_init(struct triangles_compositor *compositor) {
     }
     printf("  [INIT] Outputs initialized\n");
     fflush(stdout);
+
+    // Add DRM fd to the Wayland event loop so page-flip callbacks are
+    // dispatched automatically whenever the kernel signals the fd readable.
+    struct wl_event_source *drm_source =
+        wl_event_loop_add_fd(compositor->event_loop, compositor->drm_fd,
+                             WL_EVENT_READABLE,
+                             drm_event_source_dispatch, compositor);
+    if (!drm_source)
+        fprintf(stderr, "  [INIT] Warning: failed to add DRM fd to event loop\n");
     
     // Initialize input
     printf("  [INIT] Initializing input system...\n");

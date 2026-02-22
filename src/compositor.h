@@ -52,8 +52,16 @@ struct triangles_output {
     struct gbm_bo *current_bo;
     struct gbm_bo *next_bo;
     
-    // Framebuffers
-    uint32_t fb_id;
+    // EGL — persisted across frames so GBM buffer queue works correctly
+    EGLSurface egl_surface;
+
+    // Framebuffers — cached per GBM BO to avoid AddFB/RmFB every frame
+    uint32_t fb_id;        // fb for current_bo
+    uint32_t next_fb_id;   // fb for next_bo (pending flip)
+
+    // Repaint scheduling
+    bool needs_repaint;    // set by input/commits, cleared by repaint loop
+    bool flip_pending;     // drmModePageFlip outstanding, don't queue another
     
     // Output properties
     int32_t x, y;
@@ -106,6 +114,17 @@ struct triangles_surface {
     bool is_dmabuf;  // true when current buffer is a DMA-BUF
 };
 
+// Titlebar decoration (compositor-side, no client involvement)
+// Must be defined before triangles_view which embeds it by value.
+struct triangles_titlebar {
+    int32_t x, y;
+    int32_t width;
+    int32_t height;
+    bool    dragging;
+    int32_t drag_start_ptr_x, drag_start_ptr_y;
+    int32_t drag_start_win_x, drag_start_win_y;
+};
+
 // View - positioned surface on screen
 struct triangles_view {
     struct triangles_compositor *compositor;
@@ -121,6 +140,9 @@ struct triangles_view {
     double transform_x, transform_y;
     double transform_width, transform_height;
     
+    // Compositor-side titlebar decoration
+    struct triangles_titlebar titlebar;
+
     bool mapped;
 };
 
@@ -133,23 +155,40 @@ struct triangles_seat {
     char *name;
     uint32_t capabilities;
     
+    // Per-seat resource lists (one entry per client that bound wl_keyboard/wl_pointer)
+    struct wl_list keyboard_resources;  // wl_resource list via wl_resource_get_link
+    struct wl_list pointer_resources;
+
     // Keyboard
     struct {
         struct xkb_context *context;
         struct xkb_keymap *keymap;
         struct xkb_state *state;
+        char *keymap_string;   // serialized keymap sent to clients
+        int   keymap_fd;       // memfd holding keymap_string
+        size_t keymap_size;    // strlen + 1
         
-        uint32_t *keys;
+        uint32_t *keys;        // currently held keycodes (for enter event)
         size_t num_keys;
+        size_t keys_cap;
+
+        struct triangles_surface *focus;  // surface with keyboard focus
     } keyboard;
     
     // Pointer
     struct {
         double x, y;
-        struct triangles_surface *focus;
+        struct triangles_surface *focus;  // surface under cursor
+        // Titlebar drag state
+        struct triangles_view *dragging_view;
+        double drag_start_ptr_x, drag_start_ptr_y;
+        int32_t drag_start_win_x, drag_start_win_y;
+        // Cursor sprite set by client via wl_pointer.set_cursor
+        struct triangles_surface *cursor_surface;
+        int32_t cursor_hotspot_x, cursor_hotspot_y;
     } pointer;
     
-    struct wl_list resources;
+    struct wl_list resources;  // legacy — kept for seat resource tracking
 };
 
 // Main compositor structure
@@ -209,7 +248,9 @@ void triangles_compositor_destroy(struct triangles_compositor *compositor);
 struct triangles_output *triangles_output_create(struct triangles_compositor *compositor,
                                                   uint32_t connector_id);
 void triangles_output_destroy(struct triangles_output *output);
-void triangles_output_repaint(struct triangles_output *output);
+void triangles_output_repaint(struct triangles_output *output);     // immediate paint
+void triangles_output_schedule_repaint(struct triangles_output *output); // deferred
+void triangles_output_drm_dispatch(struct triangles_compositor *compositor);
 void triangles_output_set_scale(struct triangles_output *output, double scale);
 
 // Surface functions
@@ -235,7 +276,34 @@ void triangles_renderer_end(struct triangles_output *output);
 
 // Input functions
 bool triangles_input_init(struct triangles_compositor *compositor);
-void triangles_input_handle_event(struct triangles_compositor *compositor);
+void triangles_input_handle_event(struct triangles_compositor *compositor,
+                                   struct libinput_event *event);
+
+// Input focus helpers (called from xdg_shell.c / pointer hit-testing)
+void triangles_keyboard_set_focus(struct triangles_seat *seat,
+                                   struct triangles_surface *surface);
+void triangles_keyboard_send_key(struct triangles_seat *seat,
+                                  uint32_t keycode,
+                                  enum libinput_key_state state);
+void triangles_pointer_set_focus(struct triangles_seat *seat,
+                                  struct triangles_surface *surface,
+                                  double sx, double sy);
+void triangles_pointer_clear_focus(struct triangles_seat *seat);
+void triangles_pointer_send_motion(struct triangles_seat *seat, double sx, double sy);
+void triangles_pointer_send_button(struct triangles_seat *seat, uint32_t button,
+                                    enum libinput_button_state state);
+void triangles_pointer_send_axis(struct triangles_seat *seat,
+                                  enum wl_pointer_axis axis, double value);
+void triangles_pointer_update_focus(struct triangles_compositor *compositor,
+                                     struct triangles_seat *seat);
+void triangles_seat_update_keymap(struct triangles_seat *seat);
+
+// Titlebar / decoration rendering
+void triangles_renderer_render_titlebar(struct triangles_view *view);
+void triangles_renderer_render_cursor(struct triangles_seat *seat,
+                                       struct triangles_output *output);
+
+#define TITLEBAR_HEIGHT 24
 
 // DMA-BUF functions
 bool   triangles_dmabuf_init(struct triangles_compositor *compositor);

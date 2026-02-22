@@ -139,27 +139,44 @@ bool triangles_renderer_init(struct triangles_compositor *compositor) {
     return true;
 }
 
+// ─── Shared quad draw helper ─────────────────────────────────────────────────
+static void draw_quad(void) {
+    float vertices[] = {
+        0.0f, 0.0f, 0.0f, 0.0f,
+        1.0f, 0.0f, 1.0f, 0.0f,
+        1.0f, 1.0f, 1.0f, 1.0f,
+        0.0f, 1.0f, 0.0f, 1.0f,
+    };
+    GLushort indices[] = { 0, 1, 2, 0, 2, 3 };
+    glVertexAttribPointer(shader.position_attr, 2, GL_FLOAT, GL_FALSE,
+                          4 * sizeof(float), vertices);
+    glVertexAttribPointer(shader.texcoord_attr, 2, GL_FLOAT, GL_FALSE,
+                          4 * sizeof(float), vertices + 2);
+    glEnableVertexAttribArray(shader.position_attr);
+    glEnableVertexAttribArray(shader.texcoord_attr);
+    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, indices);
+    glDisableVertexAttribArray(shader.position_attr);
+    glDisableVertexAttribArray(shader.texcoord_attr);
+}
+
 void triangles_renderer_begin(struct triangles_output *output) {
-    // Set viewport - this is where fractional scaling matters
-    // We render at the full resolution of the output
     glViewport(0, 0, output->width, output->height);
-    
-    // Clear with a background color
-    glClearColor(0.1, 0.1, 0.1, 1.0);
+
+    // Enable blending for transparent surfaces and cursor
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
-    
-    // Use shader program
+
     glUseProgram(shader.program);
-    
-    // Set up orthographic projection matrix for 2D rendering
-    // This matrix accounts for the output's fractional scale
+
     float projection[16] = {
         2.0f / output->width, 0, 0, 0,
         0, -2.0f / output->height, 0, 0,
         0, 0, -1, 0,
         -1, 1, 0, 1
     };
-    
     glUniformMatrix4fv(shader.projection_uniform, 1, GL_FALSE, projection);
 }
 
@@ -211,43 +228,168 @@ void triangles_renderer_render_view(struct triangles_view *view) {
     
     // Set alpha
     glUniform1f(shader.alpha_uniform, 1.0f);
-    
-    // Vertex data: position and texture coordinates
-    float vertices[] = {
-        // pos      texcoord
-        0.0f, 0.0f, 0.0f, 0.0f,
-        1.0f, 0.0f, 1.0f, 0.0f,
-        1.0f, 1.0f, 1.0f, 1.0f,
-        0.0f, 1.0f, 0.0f, 1.0f,
-    };
-    
-    GLushort indices[] = {
-        0, 1, 2,
-        0, 2, 3,
-    };
-    
-    // Set up vertex attributes
-    glVertexAttribPointer(shader.position_attr, 2, GL_FLOAT, GL_FALSE,
-                         4 * sizeof(float), vertices);
-    glVertexAttribPointer(shader.texcoord_attr, 2, GL_FLOAT, GL_FALSE,
-                         4 * sizeof(float), vertices + 2);
-    
-    glEnableVertexAttribArray(shader.position_attr);
-    glEnableVertexAttribArray(shader.texcoord_attr);
-    
-    // Draw
-    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, indices);
-    
-    glDisableVertexAttribArray(shader.position_attr);
-    glDisableVertexAttribArray(shader.texcoord_attr);
+
+    draw_quad();
 }
 
 void triangles_renderer_end(struct triangles_output *output) {
-    // Finish rendering
+    (void)output;
     glFinish();
 }
 
-// Helper function to create texture from buffer (SHM or DMA-BUF)
+// Render a solid-color titlebar above a view.
+// Uses the same shader but with a 1x1 white texture and a tinted alpha,
+// achieved by setting alpha < 1 and using the colour via the projection offset.
+// Simpler approach: just draw a flat-colour quad by binding a 1px white texture
+// and multiplying in the fragment shader via the alpha uniform hack — but our
+// shader only has alpha, not a colour uniform.  So we create a tiny 1x1 texture
+// once and tint by setting alpha=1 and relying on the RGBA of that pixel.
+// Actually simplest: generate a 1x1 solid-colour texture on first call.
+void triangles_renderer_render_titlebar(struct triangles_view *view) {
+    if (!view || !view->mapped || !view->output) return;
+
+    struct triangles_output *output = view->output;
+
+    // ── Create a 1×1 solid-colour texture (once per process) ─────────────────
+    static GLuint bar_texture = 0;
+    if (!bar_texture) {
+        glGenTextures(1, &bar_texture);
+        glBindTexture(GL_TEXTURE_2D, bar_texture);
+        // Muted blue-grey titlebar colour: #3d6080 (R=0x3d G=0x60 B=0x80 A=0xff)
+        uint8_t pixel[4] = { 0x3d, 0x60, 0x80, 0xff };
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, pixel);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    }
+
+    double scale  = output->scale;
+    double bar_x  = view->x * scale;
+    double bar_y  = (view->y - TITLEBAR_HEIGHT) * scale;
+    double bar_w  = view->width  * scale;
+    double bar_h  = TITLEBAR_HEIGHT * scale;
+
+    float transform[16] = {
+        (float)bar_w, 0, 0, 0,
+        0, (float)bar_h, 0, 0,
+        0, 0, 1, 0,
+        (float)bar_x, (float)bar_y, 0, 1,
+    };
+
+    // Reuse the same shader that render_view uses (already glUseProgram'd by renderer_begin)
+    glUniformMatrix4fv(shader.transform_uniform, 1, GL_FALSE, transform);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, bar_texture);
+    glUniform1i(shader.tex_uniform, 0);
+    glUniform1f(shader.alpha_uniform, 1.0f);
+
+    draw_quad();
+}
+
+// ─── Fallback arrow cursor texture ───────────────────────────────────────────
+// 16×16 ARGB bitmap drawn by hand.
+// '.' = transparent, 'X' = black, 'O' = white outline
+// The classic left-pointing arrow shape.
+#define _ 0x00000000u   // transparent
+#define B 0xFF000000u   // black
+#define W 0xFFFFFFFFu   // white
+
+static const uint32_t fallback_cursor_bitmap[16][16] = {
+    { B,_,_,_,_,_,_,_,_,_,_,_,_,_,_,_ },
+    { B,B,_,_,_,_,_,_,_,_,_,_,_,_,_,_ },
+    { B,W,B,_,_,_,_,_,_,_,_,_,_,_,_,_ },
+    { B,W,W,B,_,_,_,_,_,_,_,_,_,_,_,_ },
+    { B,W,W,W,B,_,_,_,_,_,_,_,_,_,_,_ },
+    { B,W,W,W,W,B,_,_,_,_,_,_,_,_,_,_ },
+    { B,W,W,W,W,W,B,_,_,_,_,_,_,_,_,_ },
+    { B,W,W,W,W,W,W,B,_,_,_,_,_,_,_,_ },
+    { B,W,W,W,W,W,W,W,B,_,_,_,_,_,_,_ },
+    { B,W,W,W,W,W,B,B,B,_,_,_,_,_,_,_ },
+    { B,W,W,B,W,W,B,_,_,_,_,_,_,_,_,_ },
+    { B,W,B,_,B,W,W,B,_,_,_,_,_,_,_,_ },
+    { B,B,_,_,_,B,W,W,B,_,_,_,_,_,_,_ },
+    { B,_,_,_,_,_,B,W,B,_,_,_,_,_,_,_ },
+    { _,_,_,_,_,_,_,B,B,_,_,_,_,_,_,_ },
+    { _,_,_,_,_,_,_,_,_,_,_,_,_,_,_,_ },
+};
+
+#undef _
+#undef B
+#undef W
+
+static GLuint get_fallback_cursor_texture(void) {
+    static GLuint tex = 0;
+    if (tex) return tex;
+
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 16, 16, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, fallback_cursor_bitmap);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    return tex;
+}
+
+// ─── Cursor render ────────────────────────────────────────────────────────────
+
+// Render the pointer cursor sprite at the current pointer position.
+// Uses the client-provided surface if available, otherwise the built-in arrow.
+// Called last in the repaint loop so it always appears on top.
+void triangles_renderer_render_cursor(struct triangles_seat *seat,
+                                       struct triangles_output *output) {
+    double scale = output->scale;
+    double x, y, w, h;
+    GLuint tex;
+    GLint filter;
+
+    struct triangles_surface *cursor = seat->pointer.cursor_surface;
+
+    if (cursor && cursor->has_buffer) {
+        // Client-provided cursor
+        x = (seat->pointer.x - seat->pointer.cursor_hotspot_x) * scale;
+        y = (seat->pointer.y - seat->pointer.cursor_hotspot_y) * scale;
+        if (cursor->scale > 1.0) {
+            w = cursor->buffer_width  / cursor->scale * scale;
+            h = cursor->buffer_height / cursor->scale * scale;
+        } else {
+            w = cursor->buffer_width  * scale;
+            h = cursor->buffer_height * scale;
+        }
+        tex    = cursor->texture;
+        filter = (scale != 1.0) ? GL_LINEAR : GL_NEAREST;
+    } else {
+        // Fallback built-in arrow — hotspot is (0,0) i.e. top-left pixel
+        x = seat->pointer.x * scale;
+        y = seat->pointer.y * scale;
+        w = 16.0 * scale;
+        h = 16.0 * scale;
+        tex    = get_fallback_cursor_texture();
+        filter = GL_NEAREST;
+    }
+
+    float transform[16] = {
+        (float)w, 0, 0, 0,
+        0, (float)h, 0, 0,
+        0, 0, 1, 0,
+        (float)x, (float)y, 0, 1,
+    };
+    glUniformMatrix4fv(shader.transform_uniform, 1, GL_FALSE, transform);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glUniform1i(shader.tex_uniform, 0);
+    glUniform1f(shader.alpha_uniform, 1.0f);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    draw_quad();
+}
+
 GLuint triangles_renderer_create_texture(struct triangles_surface *surface,
                                         struct wl_resource *buffer) {
     if (!buffer) {
